@@ -1,6 +1,8 @@
 import argparse
+import base64
 import datetime as dt
 import html
+import hmac
 import json
 import sqlite3
 import time
@@ -25,6 +27,10 @@ ADJUSTMENT_CLAMP = 0.0005
 
 CSV_COLUMNS = ["timestamp", "datetime", "premium_index"]
 
+# Web UI credentials (HTTP Basic Auth)
+WEB_USERNAME = "meta"
+WEB_PASSWORD = "mors"
+
 
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -48,8 +54,16 @@ def as_int(value: Any) -> Optional[int]:
         return None
 
 
+def format_percent(value: Optional[float], decimals: int = 2) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value) * 100:.{decimals}f}%"
+
+
 def ts_to_iso_utc(ts: int) -> str:
-    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def gate_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
@@ -142,7 +156,12 @@ def fetch_contracts_snapshot(settle: str) -> List[Dict[str, Any]]:
         index_price = as_float(item.get("index_price"))
         interval_hours = parse_funding_interval_hours(item)
 
-        if not contract or mark_price is None or index_price is None or interval_hours is None:
+        if (
+            not contract
+            or mark_price is None
+            or index_price is None
+            or interval_hours is None
+        ):
             continue
 
         divergence = compute_divergence(mark_price, index_price)
@@ -203,7 +222,12 @@ def fetch_premium_index(
 
     raw = gate_get_json(
         f"/futures/{settle}/premium_index",
-        params={"contract": contract, "interval": interval, "from": ts_from, "to": ts_to},
+        params={
+            "contract": contract,
+            "interval": interval,
+            "from": ts_from,
+            "to": ts_to,
+        },
     )
 
     if not isinstance(raw, list):
@@ -262,7 +286,9 @@ def merge_dedupe(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     if merged.empty:
         return empty_premium_df()
     merged["timestamp"] = merged["timestamp"].astype(int)
-    merged = merged.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+    merged = merged.sort_values("timestamp").drop_duplicates(
+        subset=["timestamp"], keep="last"
+    )
     merged["datetime"] = merged["timestamp"].map(ts_to_iso_utc)
     return merged[CSV_COLUMNS].reset_index(drop=True)
 
@@ -317,7 +343,11 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def log_event(
-    conn: sqlite3.Connection, ts: int, contract: str, event_type: str, details: Dict[str, Any]
+    conn: sqlite3.Connection,
+    ts: int,
+    contract: str,
+    event_type: str,
+    details: Dict[str, Any],
 ) -> None:
     conn.execute(
         """
@@ -486,28 +516,36 @@ def compute_funding_metrics(
         return None
 
     premiums = df_interval["premium_index"]
-    points = len(df_interval)
     mins_total = interval_hours * 60
-    mins_left = max(0, mins_total - points)
+
+    start_ts = as_int(df_interval["timestamp"].min())
+    now_ts = as_int(df_interval["timestamp"].max())
+    if start_ts is None or now_ts is None:
+        return None
+
+    mins_elapsed = int((now_ts - start_ts) // 60) + 1
+    mins_elapsed = min(max(1, mins_elapsed), mins_total)
+    mins_left = max(0, mins_total - mins_elapsed)
 
     current_premium = float(premiums.iloc[-1])
     mean_so_far = float(premiums.mean())
-    sum_so_far = float(premiums.sum())
-    k = min(max(1, k_last), points)
+    k = min(max(1, k_last), len(premiums))
     avg_k = float(premiums.tail(k).mean())
 
-    avg_premium_forecast = (sum_so_far + avg_k * mins_left) / mins_total
+    avg_premium_forecast = (mean_so_far * mins_elapsed + avg_k * mins_left) / mins_total
     interest_interval = interest_daily * (interval_hours / 24.0)
-    adj = clamp(interest_interval - current_premium, -ADJUSTMENT_CLAMP, ADJUSTMENT_CLAMP)
+    adj = clamp(
+        interest_interval - current_premium, -ADJUSTMENT_CLAMP, ADJUSTMENT_CLAMP
+    )
     funding_raw = avg_premium_forecast + adj
     funding_clamped = clamp(funding_raw, -fmax, fmax)
-    hit_fmax = abs(funding_raw) > fmax
+    hit_fmax = abs(funding_clamped) >= fmax - 1e-15
 
     return {
-        "points": points,
+        "points": len(premiums),
         "interval_hours": interval_hours,
         "mins_total": mins_total,
-        "mins_elapsed": points,
+        "mins_elapsed": mins_elapsed,
         "mins_left": mins_left,
         "current_premium": current_premium,
         "mean_so_far": mean_so_far,
@@ -521,14 +559,16 @@ def compute_funding_metrics(
     }
 
 
-def render_report(contract: str, state_row: Optional[sqlite3.Row], metrics: Dict[str, Any]) -> None:
+def render_report(
+    contract: str, state_row: Optional[sqlite3.Row], metrics: Dict[str, Any]
+) -> None:
     status = "inactive"
     divergence = None
     if state_row is not None:
         status = "active" if int(state_row["is_active"]) == 1 else "inactive"
         divergence = state_row["last_divergence"]
 
-    div_text = f"{float(divergence) * 100:.4f}%" if divergence is not None else "n/a"
+    div_text = format_percent(as_float(divergence))
 
     print("==== FUNDING REPORT ====")
     print(f"contract: {contract}")
@@ -537,15 +577,17 @@ def render_report(contract: str, state_row: Optional[sqlite3.Row], metrics: Dict
     print(f"current_divergence: {div_text}")
     print(f"minutes_elapsed: {metrics['mins_elapsed']}/{metrics['mins_total']}")
     print(f"minutes_left: {metrics['mins_left']}")
-    print(f"current_premium: {metrics['current_premium']:.8f}")
-    print(f"mean_premium_so_far: {metrics['mean_so_far']:.8f}")
-    print(f"forecast_avg_premium: {metrics['avg_premium_forecast']:.8f}")
-    print(f"funding_raw: {metrics['funding_raw']:.8f}")
-    print(f"funding_clamped: {metrics['funding_clamped']:.8f}")
+    print(f"current_premium: {format_percent(metrics['current_premium'])}")
+    print(f"mean_premium_so_far: {format_percent(metrics['mean_so_far'])}")
+    print(f"forecast_avg_premium: {format_percent(metrics['avg_premium_forecast'])}")
+    print(f"funding_raw: {format_percent(metrics['funding_raw'])}")
+    print(f"funding_clamped: {format_percent(metrics['funding_clamped'])}")
     print(f"hit_fmax: {'yes' if metrics['hit_fmax'] else 'no'}")
 
 
-def plot_interval(df_interval: pd.DataFrame, forecast_avg: float, out_png: Path, contract: str) -> None:
+def plot_interval(
+    df_interval: pd.DataFrame, forecast_avg: float, out_png: Path, contract: str
+) -> None:
     if df_interval.empty:
         return
 
@@ -579,7 +621,9 @@ def load_interval_slice(
         dt.datetime.fromtimestamp(now_ts, tz=dt.timezone.utc), interval_hours
     )
     sliced = df[
-        (df["timestamp"] >= start_ts) & (df["timestamp"] < end_ts) & (df["timestamp"] <= now_ts)
+        (df["timestamp"] >= start_ts)
+        & (df["timestamp"] < end_ts)
+        & (df["timestamp"] <= now_ts)
     ].copy()
     sliced = sliced.sort_values("timestamp")
     return sliced, start_ts, end_ts
@@ -612,7 +656,9 @@ def collect_contract_data(
     new_df = empty_premium_df()
     if fetch_from <= now_ts:
         try:
-            new_df = fetch_premium_index(settle, contract, fetch_from, now_ts, interval="1m")
+            new_df = fetch_premium_index(
+                settle, contract, fetch_from, now_ts, interval="1m"
+            )
         except Exception as exc:
             print(f"[WARN] premium fetch failed for {contract}: {exc}")
 
@@ -620,7 +666,9 @@ def collect_contract_data(
     save_contract_csv(csv_path, merged)
 
     df_interval, _, _ = load_interval_slice(merged, now_ts, interval_hours)
-    metrics = compute_funding_metrics(df_interval, interval_hours, k_last, interest_daily, fmax)
+    metrics = compute_funding_metrics(
+        df_interval, interval_hours, k_last, interest_daily, fmax
+    )
 
     if do_plot and metrics is not None:
         out_png = get_contract_plot_path(data_dir, contract)
@@ -668,8 +716,9 @@ def run_collect_iteration(args: argparse.Namespace, conn: sqlite3.Connection) ->
             print(f"  - {contract}: updated (insufficient data in current interval)")
             continue
         print(
-            f"  - {contract}: points={metrics['points']} raw={metrics['funding_raw']:.8f} "
-            f"clamped={metrics['funding_clamped']:.8f}"
+            f"  - {contract}: points={metrics['points']} "
+            f"raw={format_percent(metrics['funding_raw'])} "
+            f"clamped={format_percent(metrics['funding_clamped'])}"
         )
 
 
@@ -716,7 +765,12 @@ def resolve_interval_hours(state_row: Optional[sqlite3.Row]) -> Optional[int]:
 
 
 def build_contract_report(
-    token: str, db_path: Path, data_dir: Path, k_last: int, interest_daily: float, fmax: float
+    token: str,
+    db_path: Path,
+    data_dir: Path,
+    k_last: int,
+    interest_daily: float,
+    fmax: float,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     token = token.strip().upper()
     if not token:
@@ -750,7 +804,10 @@ def build_contract_report(
 
     interval_hours = resolve_interval_hours(state_row)
     if interval_hours is None:
-        return None, "no valid funding interval (4h/8h) in saved state for this contract"
+        return (
+            None,
+            "no valid funding interval (4h/8h) in saved state for this contract",
+        )
 
     now = utc_now()
     now_ts = int(now.timestamp())
@@ -768,8 +825,16 @@ def build_contract_report(
     return {
         "token": token,
         "contract": contract,
-        "status": "active" if (state_row is not None and int(state_row["is_active"]) == 1) else "inactive",
-        "divergence": float(state_row["last_divergence"]) if state_row is not None and state_row["last_divergence"] is not None else None,
+        "status": (
+            "active"
+            if (state_row is not None and int(state_row["is_active"]) == 1)
+            else "inactive"
+        ),
+        "divergence": (
+            float(state_row["last_divergence"])
+            if state_row is not None and state_row["last_divergence"] is not None
+            else None
+        ),
         "state_row": state_row,
         "metrics": metrics,
         "df_interval": df_interval,
@@ -805,6 +870,29 @@ def get_active_contracts(db_path: Path, limit: int = 100) -> List[Dict[str, Any]
     return result
 
 
+def is_web_request_authorized(headers: Any) -> bool:
+    auth_header = headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Basic "):
+        return False
+
+    encoded = auth_header[6:].strip()
+    if not encoded:
+        return False
+
+    try:
+        decoded = base64.b64decode(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return False
+
+    if ":" not in decoded:
+        return False
+
+    username, password = decoded.split(":", 1)
+    return hmac.compare_digest(username, WEB_USERNAME) and hmac.compare_digest(
+        password, WEB_PASSWORD
+    )
+
+
 def run_query(args: argparse.Namespace) -> int:
     report, error = build_contract_report(
         token=args.token,
@@ -822,7 +910,12 @@ def run_query(args: argparse.Namespace) -> int:
     render_report(report["contract"], report["state_row"], report["metrics"])
     if args.plot:
         out_png = get_contract_plot_path(Path(args.data_dir), report["contract"])
-        plot_interval(report["df_interval"], report["metrics"]["avg_premium_forecast"], out_png, report["contract"])
+        plot_interval(
+            report["df_interval"],
+            report["metrics"]["avg_premium_forecast"],
+            out_png,
+            report["contract"],
+        )
         print(f"plot saved: {out_png}")
 
     return 0
@@ -838,7 +931,7 @@ def render_web_html(
     rows_html = ""
     for row in active_rows:
         divergence = row["last_divergence"]
-        divergence_text = "n/a" if divergence is None else f"{float(divergence) * 100:.4f}%"
+        divergence_text = format_percent(as_float(divergence))
         seen = ts_to_iso_utc(int(row["last_seen_ts"])) if row["last_seen_ts"] else "n/a"
         rows_html += (
             f"<tr><td>{html.escape(str(row['contract']))}</td>"
@@ -854,9 +947,7 @@ def render_web_html(
         report_html = f"<div class='error'>{html.escape(error)}</div>"
     elif report is not None:
         metrics = report["metrics"]
-        divergence_text = (
-            "n/a" if report["divergence"] is None else f"{float(report['divergence']) * 100:.4f}%"
-        )
+        divergence_text = format_percent(as_float(report["divergence"]))
         report_html = f"""
         <h2>Funding Report: {html.escape(report["contract"])}</h2>
         <table class="metrics">
@@ -865,11 +956,11 @@ def render_web_html(
           <tr><th>Interval</th><td>{metrics["interval_hours"]}h</td></tr>
           <tr><th>Minutes elapsed</th><td>{metrics["mins_elapsed"]}/{metrics["mins_total"]}</td></tr>
           <tr><th>Minutes left</th><td>{metrics["mins_left"]}</td></tr>
-          <tr><th>Current premium</th><td>{metrics["current_premium"]:.8f}</td></tr>
-          <tr><th>Mean premium so far</th><td>{metrics["mean_so_far"]:.8f}</td></tr>
-          <tr><th>Forecast avg premium</th><td>{metrics["avg_premium_forecast"]:.8f}</td></tr>
-          <tr><th>Funding raw</th><td>{metrics["funding_raw"]:.8f}</td></tr>
-          <tr><th>Funding clamped</th><td>{metrics["funding_clamped"]:.8f}</td></tr>
+          <tr><th>Current premium</th><td>{format_percent(metrics["current_premium"])}</td></tr>
+          <tr><th>Mean premium so far</th><td>{format_percent(metrics["mean_so_far"])}</td></tr>
+          <tr><th>Forecast avg premium</th><td>{format_percent(metrics["avg_premium_forecast"])}</td></tr>
+          <tr><th>Funding raw</th><td>{format_percent(metrics["funding_raw"])}</td></tr>
+          <tr><th>Funding clamped</th><td>{format_percent(metrics["funding_clamped"])}</td></tr>
           <tr><th>Hit fmax</th><td>{"yes" if metrics["hit_fmax"] else "no"}</td></tr>
         </table>
         """
@@ -925,6 +1016,17 @@ def run_web(args: argparse.Namespace) -> int:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            if not is_web_request_authorized(self.headers):
+                self.send_response(401)
+                self.send_header(
+                    "WWW-Authenticate",
+                    'Basic realm="Gate Funding Dashboard", charset="UTF-8"',
+                )
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"Unauthorized")
+                return
+
             parsed = urlparse(self.path)
             if parsed.path != "/":
                 self.send_response(404)
@@ -949,7 +1051,9 @@ def run_web(args: argparse.Namespace) -> int:
                 )
 
             active_rows = get_active_contracts(db_path=db_path, limit=100)
-            content = render_web_html(token=token, report=report, error=error, active_rows=active_rows)
+            content = render_web_html(
+                token=token, report=report, error=error, active_rows=active_rows
+            )
 
             payload = content.encode("utf-8")
             self.send_response(200)
@@ -979,13 +1083,23 @@ def parse_args() -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="cmd", required=True)
 
-    collect_parser = subparsers.add_parser("collect", help="Collect data for active contracts")
+    collect_parser = subparsers.add_parser(
+        "collect", help="Collect data for active contracts"
+    )
     mode_group = collect_parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument("--once", action="store_true", help="Run one collection iteration")
-    mode_group.add_argument("--loop", action="store_true", help="Run collection every minute")
+    mode_group.add_argument(
+        "--once", action="store_true", help="Run one collection iteration"
+    )
+    mode_group.add_argument(
+        "--loop", action="store_true", help="Run collection every minute"
+    )
     collect_parser.add_argument("--db", default="state.db", help="SQLite database path")
-    collect_parser.add_argument("--data_dir", default="data", help="Directory for CSV/PNG files")
-    collect_parser.add_argument("--k_last", type=int, default=30, help="Last K minutes for forecast")
+    collect_parser.add_argument(
+        "--data_dir", default="data", help="Directory for CSV/PNG files"
+    )
+    collect_parser.add_argument(
+        "--k_last", type=int, default=30, help="Last K minutes for forecast"
+    )
     collect_parser.add_argument(
         "--interest_daily",
         type=float,
@@ -998,8 +1112,12 @@ def parse_args() -> argparse.Namespace:
     query_parser = subparsers.add_parser("query", help="Show funding metrics for token")
     query_parser.add_argument("--token", required=True, help="Token symbol, e.g. BTC")
     query_parser.add_argument("--db", default="state.db", help="SQLite database path")
-    query_parser.add_argument("--data_dir", default="data", help="Directory for CSV/PNG files")
-    query_parser.add_argument("--k_last", type=int, default=30, help="Last K minutes for forecast")
+    query_parser.add_argument(
+        "--data_dir", default="data", help="Directory for CSV/PNG files"
+    )
+    query_parser.add_argument(
+        "--k_last", type=int, default=30, help="Last K minutes for forecast"
+    )
     query_parser.add_argument(
         "--interest_daily",
         type=float,
@@ -1013,8 +1131,12 @@ def parse_args() -> argparse.Namespace:
     web_parser.add_argument("--host", default="127.0.0.1", help="Web host")
     web_parser.add_argument("--port", type=int, default=8080, help="Web port")
     web_parser.add_argument("--db", default="state.db", help="SQLite database path")
-    web_parser.add_argument("--data_dir", default="data", help="Directory for CSV/PNG files")
-    web_parser.add_argument("--k_last", type=int, default=30, help="Last K minutes for forecast")
+    web_parser.add_argument(
+        "--data_dir", default="data", help="Directory for CSV/PNG files"
+    )
+    web_parser.add_argument(
+        "--k_last", type=int, default=30, help="Last K minutes for forecast"
+    )
     web_parser.add_argument(
         "--interest_daily",
         type=float,
