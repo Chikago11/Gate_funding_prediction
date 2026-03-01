@@ -5,6 +5,7 @@ import html
 import hmac
 import json
 import sqlite3
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,9 +22,10 @@ REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
 BACKOFF_SECONDS = (1, 2, 4)
 
-ACTIVE_DIVERGENCE_THRESHOLD = 0.01
-DEACTIVATE_BELOW_SECONDS = 8 * 3600
+ACTIVE_DIVERGENCE_THRESHOLD = 0.005
 ADJUSTMENT_CLAMP = 0.0005
+ACTIVATION_GAP_TARGET_RATIO = 0.1
+DEFAULT_FMAX = 0.02
 
 CSV_COLUMNS = ["timestamp", "datetime", "premium_index"]
 
@@ -34,6 +36,14 @@ WEB_PASSWORD = "mors"
 
 def utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
+
+
+def configure_stdout() -> None:
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -379,6 +389,7 @@ def update_active_state(
         interval_hours = int(row["funding_interval_hours"])
         divergence = float(row["divergence"])
         interval_valid = interval_hours in (4, 8)
+        deactivate_below_seconds = interval_hours * 3600
 
         is_active = prev_active
         below_start_ts = prev_below_start
@@ -418,17 +429,20 @@ def update_active_state(
                 if prev_active:
                     if below_start_ts is None:
                         below_start_ts = now_ts
-                    elif now_ts - below_start_ts >= DEACTIVATE_BELOW_SECONDS:
+                    elif now_ts - below_start_ts >= deactivate_below_seconds:
                         is_active = False
                         below_start_ts = None
                         deactivated_ts = now_ts
-                        deactivate_reason = "deactivated_below_8h"
+                        deactivate_reason = "deactivated_below_interval"
                         log_event(
                             conn,
                             now_ts,
                             contract,
-                            "deactivated_below_8h",
-                            {"interval_hours": interval_hours},
+                            "deactivated_below_interval",
+                            {
+                                "interval_hours": interval_hours,
+                                "below_seconds": deactivate_below_seconds,
+                            },
                         )
                 else:
                     is_active = False
@@ -498,6 +512,7 @@ def update_active_state(
                     "funding_interval_hours": interval_hours,
                     "divergence": divergence,
                     "just_activated": just_activated,
+                    "activated_ts": activated_ts,
                 }
             )
 
@@ -539,7 +554,30 @@ def compute_funding_metrics(
     )
     funding_raw = avg_premium_forecast + adj
     funding_clamped = clamp(funding_raw, -fmax, fmax)
-    hit_fmax = abs(funding_clamped) >= fmax - 1e-15
+    hit_eps = 1e-15
+    hit_fmax = abs(funding_clamped) >= fmax - hit_eps
+
+    max_remaining_avg_before_pos_fmax: Optional[float] = None
+    min_remaining_avg_before_neg_fmax: Optional[float] = None
+    remaining_avg_limit_current_side: Optional[float] = None
+    remaining_avg_limit_rule = "n/a"
+    remaining_avg_limit_side = "n/a"
+    if mins_left > 0:
+        max_remaining_avg_before_pos_fmax = (
+            ((fmax - hit_eps) - adj) * mins_total - mean_so_far * mins_elapsed
+        ) / mins_left
+        min_remaining_avg_before_neg_fmax = (
+            ((-fmax + hit_eps) - adj) * mins_total - mean_so_far * mins_elapsed
+        ) / mins_left
+
+        if funding_raw >= 0:
+            remaining_avg_limit_current_side = max_remaining_avg_before_pos_fmax
+            remaining_avg_limit_rule = "<="
+            remaining_avg_limit_side = "+fmax"
+        else:
+            remaining_avg_limit_current_side = min_remaining_avg_before_neg_fmax
+            remaining_avg_limit_rule = ">="
+            remaining_avg_limit_side = "-fmax"
 
     return {
         "points": len(premiums),
@@ -553,9 +591,15 @@ def compute_funding_metrics(
         "avg_premium_forecast": avg_premium_forecast,
         "interest_interval": interest_interval,
         "adj": adj,
+        "fmax": fmax,
         "funding_raw": funding_raw,
         "funding_clamped": funding_clamped,
         "hit_fmax": hit_fmax,
+        "max_remaining_avg_before_pos_fmax": max_remaining_avg_before_pos_fmax,
+        "min_remaining_avg_before_neg_fmax": min_remaining_avg_before_neg_fmax,
+        "remaining_avg_limit_current_side": remaining_avg_limit_current_side,
+        "remaining_avg_limit_rule": remaining_avg_limit_rule,
+        "remaining_avg_limit_side": remaining_avg_limit_side,
     }
 
 
@@ -580,6 +624,17 @@ def render_report(
     print(f"current_premium: {format_percent(metrics['current_premium'])}")
     print(f"mean_premium_so_far: {format_percent(metrics['mean_so_far'])}")
     print(f"forecast_avg_premium: {format_percent(metrics['avg_premium_forecast'])}")
+    print(f"fmax: {format_percent(metrics['fmax'])}")
+    limit_current_side = metrics["remaining_avg_limit_current_side"]
+    if limit_current_side is None:
+        threshold_text = "n/a"
+    else:
+        threshold_text = (
+            f"{metrics['remaining_avg_limit_rule']} "
+            f"{format_percent(limit_current_side)} "
+            f"(avoid {metrics['remaining_avg_limit_side']})"
+        )
+    print(f"avg_remaining_threshold_current_side: {threshold_text}")
     print(f"funding_raw: {format_percent(metrics['funding_raw'])}")
     print(f"funding_clamped: {format_percent(metrics['funding_clamped'])}")
     print(f"hit_fmax: {'yes' if metrics['hit_fmax'] else 'no'}")
@@ -629,6 +684,31 @@ def load_interval_slice(
     return sliced, start_ts, end_ts
 
 
+def build_activation_gap_fill_df(
+    start_ts: int, activated_ts: int, current_divergence: float
+) -> pd.DataFrame:
+    if activated_ts <= start_ts:
+        return empty_premium_df()
+
+    minute_start = start_ts - (start_ts % 60)
+    minute_end_exclusive = activated_ts - (activated_ts % 60)
+    timestamps = list(range(minute_start, minute_end_exclusive, 60))
+    if not timestamps:
+        return empty_premium_df()
+
+    target = max(0.0, float(current_divergence)) * ACTIVATION_GAP_TARGET_RATIO
+    points = len(timestamps)
+
+    if points == 1:
+        values = [target]
+    else:
+        values = [target * (idx / (points - 1)) for idx in range(points)]
+
+    df = pd.DataFrame({"timestamp": timestamps, "premium_index": values})
+    df["datetime"] = df["timestamp"].map(ts_to_iso_utc)
+    return df[CSV_COLUMNS]
+
+
 def collect_contract_data(
     active_row: Dict[str, Any],
     now: dt.datetime,
@@ -646,8 +726,18 @@ def collect_contract_data(
 
     csv_path = get_contract_csv_path(data_dir, contract)
     old_df = load_contract_csv(csv_path)
+    is_just_activated = bool(active_row.get("just_activated", False))
 
-    if old_df.empty or active_row.get("just_activated", False):
+    if is_just_activated:
+        activated_ts = as_int(active_row.get("activated_ts"))
+        if activated_ts is None:
+            activated_ts = now_ts
+        divergence_now = as_float(active_row.get("divergence")) or 0.0
+        gap_df = build_activation_gap_fill_df(start_ts, activated_ts, divergence_now)
+        if not gap_df.empty:
+            old_df = merge_dedupe(old_df, gap_df)
+
+    if old_df.empty or is_just_activated:
         fetch_from = start_ts
     else:
         last_ts = int(old_df["timestamp"].max())
@@ -948,6 +1038,15 @@ def render_web_html(
     elif report is not None:
         metrics = report["metrics"]
         divergence_text = format_percent(as_float(report["divergence"]))
+        limit_current_side = metrics["remaining_avg_limit_current_side"]
+        if limit_current_side is None:
+            threshold_text = "n/a"
+        else:
+            threshold_text = (
+                f'{metrics["remaining_avg_limit_rule"]} '
+                f'{format_percent(limit_current_side)} '
+                f'(avoid {metrics["remaining_avg_limit_side"]})'
+            )
         report_html = f"""
         <h2>Funding Report: {html.escape(report["contract"])}</h2>
         <table class="metrics">
@@ -959,11 +1058,33 @@ def render_web_html(
           <tr><th>Current premium</th><td>{format_percent(metrics["current_premium"])}</td></tr>
           <tr><th>Mean premium so far</th><td>{format_percent(metrics["mean_so_far"])}</td></tr>
           <tr><th>Forecast avg premium</th><td>{format_percent(metrics["avg_premium_forecast"])}</td></tr>
+          <tr><th>Funding cap (fmax)</th><td>{format_percent(metrics["fmax"])}</td></tr>
+          <tr><th>Avg left threshold (current side)</th><td>{html.escape(threshold_text)}</td></tr>
           <tr><th>Funding raw</th><td>{format_percent(metrics["funding_raw"])}</td></tr>
           <tr><th>Funding clamped</th><td>{format_percent(metrics["funding_clamped"])}</td></tr>
           <tr><th>Hit fmax</th><td>{"yes" if metrics["hit_fmax"] else "no"}</td></tr>
         </table>
         """
+    legend_html = """
+    <h3>Легенда (рус)</h3>
+    <table class="legend">
+      <tr><th>Status</th><td>Статус контракта в локальной базе: active/inactive.</td></tr>
+      <tr><th>Current divergence</th><td>Текущее расхождение между mark и index: |mark - index| / |index|.</td></tr>
+      <tr><th>Interval</th><td>Длина текущего funding-окна (обычно 4ч или 8ч).</td></tr>
+      <tr><th>Minutes elapsed</th><td>Сколько минут уже прошло в текущем funding-окне.</td></tr>
+      <tr><th>Minutes left</th><td>Сколько минут осталось до конца funding-окна.</td></tr>
+      <tr><th>Current premium</th><td>Последнее значение premium index (за последнюю минуту).</td></tr>
+      <tr><th>Mean premium so far</th><td>Средний premium index с начала текущего funding-окна до сейчас.</td></tr>
+      <tr><th>Forecast avg premium</th><td>Прогноз среднего premium index к закрытию окна.</td></tr>
+      <tr><th>Funding cap (fmax)</th><td>Лимит funding в модели (ограничение по модулю).</td></tr>
+      <tr><th>Avg left threshold (current side)</th><td>Порог для среднего premium на оставшееся время, чтобы не упереться в cap на текущей стороне.</td></tr>
+      <tr><th>Funding raw</th><td>Сырой расчёт funding до применения лимита fmax.</td></tr>
+      <tr><th>Funding clamped</th><td>Итог после ограничения Funding raw диапазоном [-fmax, +fmax].</td></tr>
+      <tr><th>Hit fmax</th><td>Признак, что итог уткнулся в лимит fmax.</td></tr>
+      <tr><th>Active Contracts</th><td>Список активных контрактов (топ-100 по divergence) из локальной базы.</td></tr>
+      <tr><th>Last seen (UTC)</th><td>Время (UTC), когда контракт в последний раз обновлялся коллектором.</td></tr>
+    </table>
+    """
 
     return f"""<!doctype html>
 <html lang="en">
@@ -982,6 +1103,8 @@ def render_web_html(
     table {{ width:100%; border-collapse: collapse; }}
     th, td {{ border-bottom:1px solid #e5eaf0; padding:8px; text-align:left; font-size:14px; }}
     .metrics th {{ width:240px; }}
+    .legend {{ margin-top:16px; }}
+    .legend th {{ width:260px; }}
     .error {{ background:#fdecec; border:1px solid #f5b5b5; color:#8f1d1d; padding:10px; border-radius:8px; }}
   </style>
 </head>
@@ -997,6 +1120,7 @@ def render_web_html(
     </div>
     <div class="card">
       {report_html if report_html else "<p>No token selected.</p>"}
+      {legend_html}
     </div>
     <div class="card">
       <h2>Active Contracts (top 100 by divergence)</h2>
@@ -1106,7 +1230,9 @@ def parse_args() -> argparse.Namespace:
         default=0.0003,
         help="Interest value per day (e.g. 0.0003)",
     )
-    collect_parser.add_argument("--fmax", type=float, default=0.003, help="Funding cap")
+    collect_parser.add_argument(
+        "--fmax", type=float, default=DEFAULT_FMAX, help="Funding cap"
+    )
     collect_parser.add_argument("--plot", action="store_true", help="Save PNG plots")
 
     query_parser = subparsers.add_parser("query", help="Show funding metrics for token")
@@ -1124,7 +1250,9 @@ def parse_args() -> argparse.Namespace:
         default=0.0003,
         help="Interest value per day (e.g. 0.0003)",
     )
-    query_parser.add_argument("--fmax", type=float, default=0.003, help="Funding cap")
+    query_parser.add_argument(
+        "--fmax", type=float, default=DEFAULT_FMAX, help="Funding cap"
+    )
     query_parser.add_argument("--plot", action="store_true", help="Save PNG plot")
 
     web_parser = subparsers.add_parser("web", help="Run web dashboard")
@@ -1143,7 +1271,9 @@ def parse_args() -> argparse.Namespace:
         default=0.0003,
         help="Interest value per day (e.g. 0.0003)",
     )
-    web_parser.add_argument("--fmax", type=float, default=0.003, help="Funding cap")
+    web_parser.add_argument(
+        "--fmax", type=float, default=DEFAULT_FMAX, help="Funding cap"
+    )
 
     args = parser.parse_args()
     if getattr(args, "k_last", 1) <= 0:
@@ -1158,6 +1288,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_stdout()
     args = parse_args()
     if args.cmd == "collect":
         if args.once:
