@@ -10,7 +10,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -91,6 +91,21 @@ def gate_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
                 time.sleep(BACKOFF_SECONDS[idx])
 
     raise RuntimeError(f"Gate API request failed for {url}: {last_error}")
+
+
+def fetch_contract_funding_from_gate(settle: str, contract: str) -> Dict[str, Any]:
+    quoted_contract = quote(contract, safe="")
+    raw = gate_get_json(f"/futures/{settle}/contracts/{quoted_contract}")
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Unexpected contract response for {contract}")
+
+    return {
+        "funding_rate": as_float(raw.get("funding_rate")),
+        "funding_rate_indicative": as_float(raw.get("funding_rate_indicative")),
+        "funding_next_apply": as_int(raw.get("funding_next_apply")),
+        "funding_rate_limit": as_float(raw.get("funding_rate_limit")),
+        "interest_rate": as_float(raw.get("interest_rate")),
+    }
 
 
 def normalize_interval_hours(raw: Any) -> Optional[int]:
@@ -301,6 +316,69 @@ def merge_dedupe(old_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     )
     merged["datetime"] = merged["timestamp"].map(ts_to_iso_utc)
     return merged[CSV_COLUMNS].reset_index(drop=True)
+
+
+def fill_missing_minutes_from_neighbors(
+    df: pd.DataFrame, start_ts: int, end_ts: int
+) -> pd.DataFrame:
+    if df.empty:
+        return empty_premium_df()
+
+    minute_start = start_ts - (start_ts % 60)
+    minute_end = end_ts - (end_ts % 60)
+    if minute_end < minute_start:
+        return df[CSV_COLUMNS].sort_values("timestamp").reset_index(drop=True)
+
+    in_window = df[
+        (df["timestamp"] >= minute_start) & (df["timestamp"] <= minute_end)
+    ].copy()
+    out_window = df[
+        (df["timestamp"] < minute_start) | (df["timestamp"] > minute_end)
+    ].copy()
+
+    # Need at least one known point in the window to interpolate missing minutes.
+    if in_window.empty:
+        return df[CSV_COLUMNS].sort_values("timestamp").reset_index(drop=True)
+
+    in_window = (
+        in_window.sort_values("timestamp")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    full_index = pd.Index(range(minute_start, minute_end + 60, 60), name="timestamp")
+    window_indexed = in_window.set_index("timestamp")[["premium_index"]]
+    window_indexed = window_indexed.reindex(full_index)
+    window_indexed["premium_index"] = pd.to_numeric(
+        window_indexed["premium_index"], errors="coerce"
+    )
+    window_indexed["premium_index"] = window_indexed["premium_index"].interpolate(
+        method="linear", limit_direction="both"
+    )
+    window_indexed["premium_index"] = window_indexed["premium_index"].ffill().bfill()
+    window_indexed = window_indexed.dropna(subset=["premium_index"])
+
+    filled_window = window_indexed.reset_index()
+    if filled_window.empty:
+        return df[CSV_COLUMNS].sort_values("timestamp").reset_index(drop=True)
+
+    filled_window["timestamp"] = filled_window["timestamp"].astype(int)
+    filled_window["datetime"] = filled_window["timestamp"].map(ts_to_iso_utc)
+    filled_window = filled_window[CSV_COLUMNS]
+
+    if out_window.empty:
+        return filled_window.sort_values("timestamp").reset_index(drop=True)
+
+    combined = pd.concat([out_window[CSV_COLUMNS], filled_window], ignore_index=True)
+    combined["timestamp"] = pd.to_numeric(combined["timestamp"], errors="coerce")
+    combined["premium_index"] = pd.to_numeric(combined["premium_index"], errors="coerce")
+    combined = combined.dropna(subset=["timestamp", "premium_index"])
+    combined["timestamp"] = combined["timestamp"].astype(int)
+    combined = combined.sort_values("timestamp").drop_duplicates(
+        subset=["timestamp"], keep="last"
+    )
+    combined["datetime"] = combined["timestamp"].map(ts_to_iso_utc)
+    return combined[CSV_COLUMNS].reset_index(drop=True)
 
 
 def save_contract_csv(path: Path, df: pd.DataFrame) -> None:
@@ -552,6 +630,9 @@ def compute_funding_metrics(
     adj = clamp(
         interest_interval - current_premium, -ADJUSTMENT_CLAMP, ADJUSTMENT_CLAMP
     )
+    current_funding_raw = mean_so_far + adj
+    current_funding_clamped = clamp(current_funding_raw, -fmax, fmax)
+    current_hit_fmax = abs(current_funding_clamped) >= fmax - 1e-15
     funding_raw = avg_premium_forecast + adj
     funding_clamped = clamp(funding_raw, -fmax, fmax)
     hit_eps = 1e-15
@@ -592,6 +673,9 @@ def compute_funding_metrics(
         "interest_interval": interest_interval,
         "adj": adj,
         "fmax": fmax,
+        "current_funding_raw": current_funding_raw,
+        "current_funding_clamped": current_funding_clamped,
+        "current_hit_fmax": current_hit_fmax,
         "funding_raw": funding_raw,
         "funding_clamped": funding_clamped,
         "hit_fmax": hit_fmax,
@@ -604,7 +688,11 @@ def compute_funding_metrics(
 
 
 def render_report(
-    contract: str, state_row: Optional[sqlite3.Row], metrics: Dict[str, Any]
+    contract: str,
+    state_row: Optional[sqlite3.Row],
+    metrics: Dict[str, Any],
+    gate_funding: Optional[Dict[str, Any]] = None,
+    gate_funding_error: Optional[str] = None,
 ) -> None:
     status = "inactive"
     divergence = None
@@ -623,6 +711,17 @@ def render_report(
     print(f"minutes_left: {metrics['mins_left']}")
     print(f"current_premium: {format_percent(metrics['current_premium'])}")
     print(f"mean_premium_so_far: {format_percent(metrics['mean_so_far'])}")
+    print(
+        f"current_funding_gate_formula: "
+        f"{format_percent(metrics['current_funding_clamped'])}"
+    )
+    if gate_funding_error:
+        print(f"current_funding_gate_api: n/a ({gate_funding_error})")
+    else:
+        gate_rate = gate_funding.get("funding_rate") if gate_funding else None
+        if gate_rate is None and gate_funding:
+            gate_rate = gate_funding.get("funding_rate_indicative")
+        print(f"current_funding_gate_api: {format_percent(as_float(gate_rate))}")
     print(f"forecast_avg_premium: {format_percent(metrics['avg_premium_forecast'])}")
     print(f"fmax: {format_percent(metrics['fmax'])}")
     limit_current_side = metrics["remaining_avg_limit_current_side"]
@@ -753,6 +852,7 @@ def collect_contract_data(
             print(f"[WARN] premium fetch failed for {contract}: {exc}")
 
     merged = merge_dedupe(old_df, new_df)
+    merged = fill_missing_minutes_from_neighbors(merged, start_ts, now_ts)
     save_contract_csv(csv_path, merged)
 
     df_interval, _, _ = load_interval_slice(merged, now_ts, interval_hours)
@@ -901,13 +1001,30 @@ def build_contract_report(
 
     now = utc_now()
     now_ts = int(now.timestamp())
-    df_interval, _, _ = load_interval_slice(full_df, now_ts, interval_hours)
+    df_interval, start_ts, _ = load_interval_slice(full_df, now_ts, interval_hours)
+    df_interval = fill_missing_minutes_from_neighbors(df_interval, start_ts, now_ts)
+
+    gate_funding: Optional[Dict[str, Any]] = None
+    gate_funding_error: Optional[str] = None
+    effective_fmax = fmax
+    effective_interest_daily = interest_daily
+    try:
+        gate_funding = fetch_contract_funding_from_gate(SETTLE, contract)
+        gate_fmax = as_float(gate_funding.get("funding_rate_limit"))
+        gate_interest = as_float(gate_funding.get("interest_rate"))
+        if gate_fmax is not None and gate_fmax > 0:
+            effective_fmax = gate_fmax
+        if gate_interest is not None and gate_interest >= 0:
+            effective_interest_daily = gate_interest
+    except Exception as exc:
+        gate_funding_error = str(exc)
+
     metrics = compute_funding_metrics(
         df_interval=df_interval,
         interval_hours=interval_hours,
         k_last=k_last,
-        interest_daily=interest_daily,
-        fmax=fmax,
+        interest_daily=effective_interest_daily,
+        fmax=effective_fmax,
     )
     if metrics is None:
         return None, "insufficient data in current interval"
@@ -928,6 +1045,10 @@ def build_contract_report(
         "state_row": state_row,
         "metrics": metrics,
         "df_interval": df_interval,
+        "gate_funding": gate_funding,
+        "gate_funding_error": gate_funding_error,
+        "effective_fmax": effective_fmax,
+        "effective_interest_daily": effective_interest_daily,
     }, None
 
 
@@ -997,7 +1118,13 @@ def run_query(args: argparse.Namespace) -> int:
         return 1
 
     assert report is not None
-    render_report(report["contract"], report["state_row"], report["metrics"])
+    render_report(
+        report["contract"],
+        report["state_row"],
+        report["metrics"],
+        report.get("gate_funding"),
+        report.get("gate_funding_error"),
+    )
     if args.plot:
         out_png = get_contract_plot_path(Path(args.data_dir), report["contract"])
         plot_interval(
@@ -1038,6 +1165,14 @@ def render_web_html(
     elif report is not None:
         metrics = report["metrics"]
         divergence_text = format_percent(as_float(report["divergence"]))
+        gate_funding = report.get("gate_funding")
+        gate_funding_error = report.get("gate_funding_error")
+        gate_rate = gate_funding.get("funding_rate") if gate_funding else None
+        if gate_rate is None and gate_funding:
+            gate_rate = gate_funding.get("funding_rate_indicative")
+        gate_api_funding_text = format_percent(as_float(gate_rate))
+        if gate_funding_error:
+            gate_api_funding_text = f"n/a ({gate_funding_error})"
         limit_current_side = metrics["remaining_avg_limit_current_side"]
         if limit_current_side is None:
             threshold_text = "n/a"
@@ -1057,6 +1192,8 @@ def render_web_html(
           <tr><th>Minutes left</th><td>{metrics["mins_left"]}</td></tr>
           <tr><th>Current premium</th><td>{format_percent(metrics["current_premium"])}</td></tr>
           <tr><th>Mean premium so far</th><td>{format_percent(metrics["mean_so_far"])}</td></tr>
+          <tr><th>Current funding (Gate API)</th><td>{html.escape(gate_api_funding_text)}</td></tr>
+          <tr><th>Current funding (Gate formula, collected data)</th><td>{format_percent(metrics["current_funding_clamped"])}</td></tr>
           <tr><th>Forecast avg premium</th><td>{format_percent(metrics["avg_premium_forecast"])}</td></tr>
           <tr><th>Funding cap (fmax)</th><td>{format_percent(metrics["fmax"])}</td></tr>
           <tr><th>Avg left threshold (current side)</th><td>{html.escape(threshold_text)}</td></tr>
@@ -1075,6 +1212,8 @@ def render_web_html(
       <tr><th>Minutes left</th><td>Сколько минут осталось до конца funding-окна.</td></tr>
       <tr><th>Current premium</th><td>Последнее значение premium index (за последнюю минуту).</td></tr>
       <tr><th>Mean premium so far</th><td>Средний premium index с начала текущего funding-окна до сейчас.</td></tr>
+      <tr><th>Current funding (Gate API)</th><td>Текущее значение funding, которое Gate отдает напрямую в API контракта (`funding_rate`/`funding_rate_indicative`).</td></tr>
+      <tr><th>Current funding (Gate formula, collected data)</th><td>Текущий расчет funding по собранным minute premium-данным с учетом `funding_rate_limit` и `interest_rate` из Gate API.</td></tr>
       <tr><th>Forecast avg premium</th><td>Прогноз среднего premium index к закрытию окна.</td></tr>
       <tr><th>Funding cap (fmax)</th><td>Лимит funding в модели (ограничение по модулю).</td></tr>
       <tr><th>Avg left threshold (current side)</th><td>Порог для среднего premium на оставшееся время, чтобы не упереться в cap на текущей стороне.</td></tr>
